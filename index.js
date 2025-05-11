@@ -1616,7 +1616,7 @@ async function handleYapMessage(message) {
     yapState.messageBuffer.push(message);
     yapState.timerId = setTimeout(() => {
       triggerYapReply(agentId, message.channel.id, message.guild.id);
-    }, 5000); // 5 seconds
+    }, 3000); // 3 seconds
   }
   return yappingAgentIdsThisEvent;
 }
@@ -1653,16 +1653,18 @@ async function agentLoop(message, agent, allAgentsInChannel, depth) {
 
 
         let currentUserContent; // Will be string or array
-        const textContent = message.content;
+        const originalTextContent = message.content; // Store original message text
+        let allTextForProcessing = originalTextContent; // Initialize with original for multimodal parts and DB
 
         if (agent.multimodal && message.attachments.size > 0) {
           const contentParts = [];
-          if (textContent.trim() !== "") {
-            contentParts.push({ type: "text", text: textContent });
+          // Add original text content first if it exists
+          if (originalTextContent.trim() !== "") {
+            contentParts.push({ type: "text", text: originalTextContent });
           }
 
-          message.attachments.forEach((att) => {
-            // Basic check for common image types
+          // Use a for...of loop to handle async operations for fetching text attachments
+          for (const att of message.attachments.values()) {
             if (
               att.contentType &&
               (att.contentType.startsWith("image/") ||
@@ -1672,25 +1674,52 @@ async function agentLoop(message, agent, allAgentsInChannel, depth) {
                 type: "image_url",
                 image_url: { url: att.url }
               });
+            } else if ( // Check for .txt or .md files
+              (att.contentType === "text/plain" || att.contentType === "text/markdown" ||
+               /\.(txt|md)$/i.test(att.name || att.url))
+            ) {
+              try {
+                const response = await fetch(att.url);
+                if (response.ok) {
+                  const fileText = await response.text();
+                  const formattedFileText = `Content from attachment "${att.name}":\n${fileText}`;
+                  // Add as a new text part for the LLM
+                  contentParts.push({ type: "text", text: formattedFileText });
+                  // Append to allTextForProcessing for DB record
+                  allTextForProcessing += `\n\n${formattedFileText}`;
+                } else {
+                  console.warn(`Failed to fetch attachment ${att.name}: ${response.status}`);
+                  const failureText = `[Failed to load attachment: ${att.name}]`;
+                  contentParts.push({ type: "text", text: failureText });
+                  allTextForProcessing += `\n\n${failureText}`;
+                }
+              } catch (e) {
+                console.error(`Error fetching attachment ${att.name}: ${e.message}`);
+                const errorText = `[Error loading attachment: ${att.name}]`;
+                contentParts.push({ type: "text", text: errorText });
+                allTextForProcessing += `\n\n${errorText}`;
+              }
             }
-          });
+          }
 
-          // If attachments were processed, use the array structure
+          // Determine currentUserContent based on processed parts.
+          // If contentParts has been populated (with original text, images, or text from attachments),
+          // then currentUserContent should be this array of parts, suitable for multimodal APIs.
           if (contentParts.length > 0) {
             currentUserContent = contentParts;
           } else {
-            // Fallback to just text if no valid images were found/added
-            currentUserContent = textContent;
+            // No processable attachments found (e.g. only original text was added to contentParts and then removed, or it was empty).
+            // Fallback to original text content as a simple string.
+            currentUserContent = originalTextContent;
           }
         } else {
-          // Not multimodal or no attachments, content is just text
-          currentUserContent = textContent;
+          // Not multimodal or no attachments, content is just the original text
+          currentUserContent = originalTextContent;
         }
 
-        // Save only the text content to the database for now,
-        // as the current schema doesn't support structured multimodal.
-        // This means images won't be part of the history context for LLM calls.
-        const textContentForDB = `<msg from="${authorName}">${textContent}</msg>`;
+        // Use allTextForProcessing (which includes original text + text from attachments) for the database.
+        // This ensures that text from .txt/.md attachments becomes part of the historical context.
+        const textContentForDB = `<msg from="${authorName}">${allTextForProcessing.trim()}</msg>`;
         db.prepare(
           "INSERT INTO messages (agentId,role,content,author) VALUES (?,?,?,?)"
         ).run(agent.id, "user", textContentForDB, authorName);
@@ -1768,19 +1797,11 @@ async function agentLoop(message, agent, allAgentsInChannel, depth) {
 
   // 1. Handle System Prompt based on provider and message type
   if (effectiveSystemPromptContent && effectiveSystemPromptContent.trim() !== "") {
-    if (isNvidiaNIM && currentMessageIsMultimodalWithImage) {
-      // NVIDIA NIM with image: System prompt becomes the first user message.
-      chatHistoryForLLM.push({
-        role: "user",
-        content: effectiveSystemPromptContent
-      });
-    } else {
-      // Standard behavior: System prompt as role: "system"
-      chatHistoryForLLM.push({
-        role: "system",
-        content: effectiveSystemPromptContent
-      });
-    }
+    // Standard behavior: System prompt as role: "system"
+    chatHistoryForLLM.push({
+      role: "system",
+      content: effectiveSystemPromptContent
+    });
   }
 
   // Helper to strip <msg> tags from this agent's own assistant messages
@@ -2030,6 +2051,32 @@ async function agentLoop(message, agent, allAgentsInChannel, depth) {
   });
 
   lineReader.on("close", async () => {
+    // Handle any leftover buffer content that wasn't wrapped in <msg> tags
+    if (streamBuffer.trim()) {
+      const thinkTagRegex = /<think>[\s\S]*?<\/think>/g;
+      let cleanedLeftover = streamBuffer.replace(thinkTagRegex, "").trim();
+
+      if (cleanedLeftover) {
+        const warningMessage = "\n\n---\n*Warning: LLM did not correctly format this part of the message. It should have been wrapped in `<msg>` tags.*";
+        const messageToSendWithWarning = cleanedLeftover + warningMessage;
+        
+        if (process.env.verbose === 'true') {
+            console.log(`[VERBOSE] Sending Webhook Message (leftover) for agent ${agent.name}: ${messageToSendWithWarning}`);
+        }
+        webhookClient.send({ content: messageToSendWithWarning }).catch((e) => {
+          console.error(
+            `Webhook send error (leftover) for agent ${agent.name}: ${e.message}`
+          );
+        });
+        // Store the original leftover content (without warning) in DB and for inter-agent comms
+        db.prepare(
+          "INSERT INTO messages (agentId,role,content) VALUES (?,?,?)"
+        ).run(agent.id, "assistant", `<msg>${cleanedLeftover}</msg>`);
+        fullRepliesContent.push(cleanedLeftover); // Add to content for further processing
+      }
+    }
+    streamBuffer = ""; // Ensure buffer is cleared after processing potential leftovers
+
     const combinedReplyText = fullRepliesContent.join(" ");
     for (const otherAgent of allAgentsInChannel) {
       if (
