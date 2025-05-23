@@ -2122,3 +2122,16 @@ async function agentLoop(message, agent, allAgentsInChannel, depth) {
 }
 
 client.login(TOKEN);
+
+module.exports = {
+  encrypt,
+  decrypt,
+  splitMessage,
+  handleProviderCmd,
+  handleHelp,
+  handleContextWindow,
+  handleLoopDepth,
+  agentLoop, // Exporting for testing
+  MULTI_MSG_INSTRUCTIONS, // Exporting for testing
+  db, // Exporting for testing
+};
